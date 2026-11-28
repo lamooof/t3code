@@ -21,6 +21,7 @@ import {
   makeThreadErrorSetter,
 } from "../ChatView.logic";
 import { isUsageLimitsCommand } from "@t3tools/shared/usageLimits";
+import { isSkillReloadCommand } from "@t3tools/client-runtime/providerSkills";
 import {
   AuthOrchestrationOperateScope,
   DEFAULT_MODEL,
@@ -62,7 +63,7 @@ import {
   type ComposerSubmissionIntent,
   collapseExpandedComposerCursor,
 } from "../../composer-logic";
-import { type ChatMessage, DEFAULT_INTERACTION_MODE } from "../../types";
+import type { ChatMessage } from "../../types";
 import { recordPromptSent } from "../GitHubStarPrompt";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
@@ -96,7 +97,8 @@ import {
   previewAnnotationContextReference,
   responseContextReference,
 } from "../../lib/composerContextRecords";
-import { environmentServerConfigsAtom } from "../../state/server";
+import { environmentServerConfigsAtom, serverEnvironment } from "../../state/server";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { threadEnvironment } from "../../state/threads";
 import { runMobileComposerTransition } from "./draftHeroTransition";
 import { useClientSettingsHydrated } from "../../hooks/useSettings";
@@ -391,6 +393,9 @@ export function useComposerSend(input: ComposerSendInput) {
     reportFailure: false,
   });
   const uploadThreadFeedback = useOrchestrationCommand(threadEnvironment.uploadFeedback, {
+    reportFailure: false,
+  });
+  const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
     reportFailure: false,
   });
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
@@ -808,6 +813,7 @@ export function useComposerSend(input: ComposerSendInput) {
       selectedProviderModels: ctxSelectedProviderModels,
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
+      interactionMode,
     } = sendCtx;
     const { images: composerImages, previewAnnotations: composerPreviewAnnotations } =
       mergeDirectPreviewAnnotation({
@@ -908,6 +914,8 @@ export function useComposerSend(input: ComposerSendInput) {
           },
           clearDraft: () => {
             clearComposerDraftContent(composerDraftTarget);
+            // The reply waits in the bar for the next message.
+            if (replyTo) useComposerDraftStore.getState().setReplyTo(composerDraftTarget, replyTo);
             if (currentRouteThreadKeyRef.current === routeThreadKey) {
               promptRef.current = "";
               composerRef.current?.resetCursorState();
@@ -1381,6 +1389,7 @@ export function useComposerSend(input: ComposerSendInput) {
       setSetupQueueSendThreadKey(activeThreadKey);
     } else if (isCurrentRouteThread()) {
       beginLocalDispatch({
+        providerInstanceId: ctxSelectedModelSelection.instanceId,
         preparingWorktree: multipleModelSelections !== null || Boolean(baseBranchForWorktree),
         submissionIntent:
           submissionIntent === "background" && !isLocalDraftThread
@@ -1492,7 +1501,7 @@ export function useComposerSend(input: ComposerSendInput) {
           ? { branch: localCheckoutBranchMismatch.currentBranch }
           : {}),
         runtimeMode,
-        interactionMode: DEFAULT_INTERACTION_MODE,
+        interactionMode,
       });
       if (settingsResult._tag === "Failure") {
         failure = settingsResult;
@@ -1525,7 +1534,7 @@ export function useComposerSend(input: ComposerSendInput) {
           },
           modelSelection: ctxSelectedModelSelection,
           runtimeMode,
-          interactionMode: DEFAULT_INTERACTION_MODE,
+          interactionMode,
         },
       });
       if (compactResult._tag === "Failure") {
@@ -1546,7 +1555,7 @@ export function useComposerSend(input: ComposerSendInput) {
                       title,
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,
-                      interactionMode: DEFAULT_INTERACTION_MODE,
+                      interactionMode,
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
                       createdAt: activeThread.createdAt,
@@ -1596,7 +1605,7 @@ export function useComposerSend(input: ComposerSendInput) {
           modelSelection: ctxSelectedModelSelection,
           titleSeed: title,
           runtimeMode,
-          interactionMode: DEFAULT_INTERACTION_MODE,
+          interactionMode,
           dispatchMode: turnDispatchMode,
           ...(freshArm === undefined ? {} : { freshContext: true }),
           ...(bootstrap ? { bootstrap } : {}),
@@ -1631,6 +1640,16 @@ export function useComposerSend(input: ComposerSendInput) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        if (isSkillReloadCommand(trimmed)) {
+          void refreshProviders({
+            environmentId,
+            input: {
+              instanceId: ctxSelectedModelSelection.instanceId,
+              cwd: activeThread.worktreePath ?? activeProject.workspaceRoot,
+              fresh: true,
+            },
+          });
+        }
         if (checkoutPullRequestUrl) {
           linkCheckoutPullRequest(
             scopeThreadRef(environmentId, threadIdForSend),

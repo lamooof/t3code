@@ -37,6 +37,7 @@ import type {
   ModelSelection,
   ProjectId,
   PreviewAnnotationPayload,
+  ProviderInteractionMode,
   ThreadContextRecord,
   EnvironmentContextRecord,
   ResolvedKeybindingsConfig,
@@ -53,6 +54,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
@@ -144,7 +146,9 @@ import {
   clipboardHtmlImageContent,
   imagesToAttachBesidePastedText,
   shouldHandleComposerAttachmentPaste,
+  readComposerImageBytes,
 } from "./composerAttachmentFiles";
+import { prepareImageForAttachment } from "../../lib/imageCompression";
 import {
   releaseAttachmentUpload,
   releaseDraftAttachment,
@@ -257,17 +261,23 @@ import { observeResize } from "~/lib/observeResize";
 const isEnvironmentRequestInvalidError = Schema.is(EnvironmentRequestInvalidError);
 import { toastManager } from "../ui/toast";
 import { m as resolveMessage } from "../../i18n/messages";
-import { BuildingIcon, PlayIcon, ReplyIcon } from "lucide-react";
+import { BuildingIcon, ListChecksIcon, PlayIcon, ReplyIcon } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { assistantCitationLabel } from "@t3tools/shared/assistantCitations";
 import { assistantCitationNavigation } from "../../lib/assistantCitationNavigation";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
 import { useManagedPolicy } from "../../state/managedPolicy";
+import { useClientSettings } from "../../hooks/useSettings";
 import { hasProviderSetup } from "./ProviderStatusBanner";
 import { type AppModelOption, getAppModelOptionsForInstance } from "../../modelSelection";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
-import { isVideoAttachment, type SessionPhase, type Thread } from "../../types";
+import {
+  DEFAULT_INTERACTION_MODE,
+  isVideoAttachment,
+  type SessionPhase,
+  type Thread,
+} from "../../types";
 import { type ComposerPromptHistoryPosition } from "./composerPromptHistory";
 import { usePendingUserInputDraft } from "./usePendingThreadRequests";
 import type { PendingApproval, PendingUserInput, TimelineEntry } from "../../session-logic";
@@ -276,6 +286,7 @@ import {
   resolveComposerDispatchMode,
   type ComposerDispatchMode,
 } from "@t3tools/client-runtime/state/composer-dispatch";
+import { parseCodexFeedbackCommand } from "@t3tools/client-runtime/state/threads";
 import {
   resolveProviderSkillsForCwd,
   resolveProviderSlashCommandsForCwd,
@@ -314,6 +325,7 @@ import {
 } from "./preparingComposerImages";
 import { HELD_COMPOSER_SEND_BANNER_ID } from "./ComposerHeldSendBanner";
 import { ComposerControlsBar } from "./ComposerControlsBar";
+import { ComposerControl, ComposerControlIcon } from "./ComposerControl";
 import { composerCommandKeyHandler } from "./composerCommandKey";
 import { promptSuggestionToAccept, usePromptSuggestion } from "./usePromptSuggestion";
 import { useFreshSessionArmed } from "./freshSessionArms";
@@ -374,6 +386,7 @@ export interface ChatComposerHandle {
     environmentContexts: EnvironmentContextRecord[];
     selectedPromptEffort: string | null;
     selectedModelSelection: ModelSelection;
+    interactionMode: ProviderInteractionMode;
     multipleModelSelections: ReadonlyArray<ModelSelection> | null;
     providerAvailable: boolean;
     selectedProvider: ProviderDriverKind;
@@ -669,6 +682,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const isEditingQueuedMessage = editingQueuedAttachments !== null;
   const applyThreadModelPick = useApplyThreadModelPick();
   const composerDraft = useComposerThreadDraft(composerDraftTarget);
+  const setInteractionMode = useComposerDraftStore((store) => store.setInteractionMode);
+  const planModeEnabled = useClientSettings((settings) => settings.planModeEnabled);
   const composerDraftTargetKeyRef = useRef("");
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed draft target key to a ref read by async handlers
   useLayoutEffect(() => {
@@ -790,7 +805,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     projectId: activeProjectId ?? undefined,
     expandImage: (imageId: string) => {
       const preview =
-        buildExpandedImagePreview(composerImages, imageId, copyComposerSnapshotStable) ??
+        buildExpandedImagePreview(
+          composerImages,
+          imageId,
+          copyComposerSnapshotStable,
+          saveComposerImageEditStable,
+        ) ??
         buildExpandedImagePreview(
           (activeEditingQueuedAttachments ?? []).flatMap(({ attachment, url }) =>
             isQueuedImageAttachment(attachment) && url ? [{ ...attachment, previewUrl: url }] : [],
@@ -899,6 +919,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const removeComposerDraftImage = useComposerDraftStore((store) => store.removeImage);
+  const replaceComposerDraftImageFile = useComposerDraftStore((store) => store.replaceImageFile);
   const addComposerDraftFiles = useComposerDraftStore((store) => store.addFiles);
   const removeComposerDraftFile = useComposerDraftStore((store) => store.removeFile);
   const insertComposerDraftTerminalContext = useComposerDraftStore(
@@ -1001,6 +1022,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     lockedInstanceId:
       activeThread?.runtime?.providerInstanceId ?? activeThreadModelSelection?.instanceId,
   });
+  const supportsPlanMode =
+    planModeEnabled &&
+    selectedProviderEntry !== undefined &&
+    selectedProviderEntry.snapshot.showInteractionModeToggle === true &&
+    multipleModelSelections === null;
+  const interactionMode = supportsPlanMode
+    ? (composerDraft.interactionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE)
+    : DEFAULT_INTERACTION_MODE;
+  const togglePlanMode = () => {
+    setInteractionMode(
+      composerDraftTarget,
+      interactionMode === "plan" ? DEFAULT_INTERACTION_MODE : "plan",
+    );
+  };
+  const togglePlanModeStable = useStableCallback(togglePlanMode);
   const noProviderAvailable =
     selectedProviderEntry === undefined && multipleModelSelections === null;
   const providerCatalogPending = noProviderAvailable && !providerCatalogKnown;
@@ -1499,6 +1535,23 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     );
   };
   const copyComposerSnapshotStable = useStableCallback(copyComposerSnapshot);
+  const saveComposerImageEdit = async (imageId: string, file: File) => {
+    if (questionAttachmentTarget && activePendingIsResponding) return null;
+    const prepared = await prepareImageForAttachment(
+      file,
+      PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+    ).catch(() => null);
+    if (!prepared?.ok) return null;
+    await readComposerImageBytes(prepared.file);
+    // The edited bytes replace the old ones under the same id, so its finished upload is stale.
+    releaseAttachmentUpload(imageId);
+    if (!replaceComposerDraftImageFile(attachmentDraftTarget, imageId, prepared.file)) return null;
+    const stored = getComposerDraft(attachmentDraftTarget)?.images.find(
+      (image) => image.id === imageId,
+    );
+    return stored ? { src: stored.previewUrl, file: stored.file } : null;
+  };
+  const saveComposerImageEditStable = useStableCallback(saveComposerImageEdit);
   const buildContextClipboardFragmentStable = useStableCallback(buildContextClipboardFragment);
   const {
     loadThreadTranscript,
@@ -2686,6 +2739,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         resolvedTheme={resolvedTheme}
         onExpandImage={onExpandImage}
         onCopySnapshot={copyComposerSnapshotStable}
+        onSaveImageEdit={saveComposerImageEditStable}
         onShowMore={expandMobileComposer}
       />
     ) : null;
@@ -2710,6 +2764,27 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       : expandedControlsIconOnlyBlockCount;
   const composerControls = (
     <RuntimeModeLimitsTargetContext value={runtimeModeLimitsFor}>
+      {supportsPlanMode && !isEditingQueuedMessage && pendingUserInputs.length === 0 ? (
+        <ComposerControl
+          size={composerControlsCollapsed ? "xs" : "sm"}
+          aria-label={gt("Plan mode")}
+          aria-pressed={interactionMode === "plan"}
+          title={gt("Plan mode")}
+          // A message sent mid-turn steers that turn, which keeps the mode it started in.
+          disabled={
+            !canOperateThread || isSendBusy || phase === "running" || phase === "connecting"
+          }
+          onClick={togglePlanModeStable}
+        >
+          <ComposerControlIcon
+            icon={ListChecksIcon}
+            size={composerControlsCollapsed ? "xs" : "sm"}
+          />
+          <span data-composer-control-label className="hidden sm:inline">
+            {gt("Plan mode")}
+          </span>
+        </ComposerControl>
+      ) : null}
       <ComposerControlsBar
         environmentId={environmentId}
         workspaceCwd={gitCwd}
@@ -2762,21 +2837,26 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // An open question owns the space above the composer. Only a machine problem,
   // which is why an answer could not go through, stays beside it.
   const replyTo = composerDraft?.replyTo ?? null;
-  const draftRunsLocally = composerRunsDraftLocally({
+  const holdsNoAttachedContext =
+    composerImages.length + composerFiles.length === 0 &&
+    composerSendState.sendableTerminalContexts.length === 0 &&
+    composerPreviewAnnotations.length === 0 &&
+    composerReviewComments.length === 0 &&
+    composerThreadContexts.length === 0 &&
+    composerEnvironmentContexts.length === 0;
+  const codexFeedbackOffered = selectedProvider === "codex" && multipleModelSelections === null;
+  const commandRunsLocally = composerRunsDraftLocally({
     text: prompt,
-    holdsOnlyText:
-      composerImages.length + composerFiles.length === 0 &&
-      composerSendState.sendableTerminalContexts.length === 0 &&
-      composerPreviewAnnotations.length === 0 &&
-      composerReviewComments.length === 0 &&
-      composerThreadContexts.length === 0 &&
-      composerEnvironmentContexts.length === 0 &&
-      replyTo === null,
+    holdsOnlyText: holdsNoAttachedContext && replyTo === null,
     sideChat: props.sideChatAvailable === true || (props.sideChatDisabledReason ?? null) !== null,
     usageLimits: props.onUsageLimitsCommand !== undefined,
-    codexFeedback: selectedProvider === "codex" && multipleModelSelections === null,
+    codexFeedback: codexFeedbackOffered,
     freshSession: props.onFreshSession !== undefined,
   });
+  // `/feedback` runs with a pending reply too, which then stays in the bar.
+  const feedbackRunsLocally =
+    codexFeedbackOffered && holdsNoAttachedContext && parseCodexFeedbackCommand(prompt) !== null;
+  const draftRunsLocally = commandRunsLocally || feedbackRunsLocally;
   const replyBannerItems: readonly ComposerBannerStackItem[] = replyTo
     ? [
         {
@@ -3533,6 +3613,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         environmentContexts: composerEnvironmentContexts,
         selectedPromptEffort,
         selectedModelSelection,
+        interactionMode,
         multipleModelSelections:
           routeKind === "draft" && multipleModelSelections !== null
             ? multipleModelSelections.map((selection) =>
@@ -3604,6 +3685,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       selectedInstanceId,
       reportedModelSelection,
       selectedModelSelection,
+      interactionMode,
       multipleModelSelections,
       setMultipleModelSelections,
       routeKind,
@@ -3639,6 +3721,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         attachmentDraftTarget={attachmentDraftTarget}
         canOperateThread={canOperateThread}
         onCopySnapshot={copyComposerSnapshotStable}
+        onSaveImageEdit={saveComposerImageEditStable}
         onExpandImage={onExpandImage}
         onFileOpen={onFileOpen}
         onRemoveImage={removeComposerImage}
